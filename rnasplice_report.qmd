@@ -143,7 +143,7 @@ if (is.null(gtf) || gtf == "") {
   if (length(json_files) > 0) {
     # Sort to ensure we get the truly latest file
     latest_json <- sort(json_files) %>% tail(1)
-    gtf <- read_json(latest_json)$gtf
+    gtf <- jsonlite::read_json(latest_json)$gtf
     logger::log_info("Found GTF in {basename(latest_json)}: {gtf}")
   }
 }
@@ -180,24 +180,6 @@ if (!is.null(gtf) && nzchar(gtf) && file.exists(gtf)) {
   reason <- if (is.null(gtf) || gtf == "") "path is empty" else "file not found"
   logger::log_warn("GTF {reason} ({gtf}). Gene/Transcript info will be omitted.")
 }
-
-
-# if(gtf==""){
-#   logger::log_info('No gtf provided. Trying to determine gtf from pipeline log...')
-#   latest_json <- list.files(fs::path(base_dir,"pipeline_info"), "params_", full.names = T) %>% .[length(.)]
-#   if(length(latest_json)>0) { gtf <- jsonlite::read_json(latest_json)$gtf }
-# }
-
-# # Warn if gtf file not found
-# if(!file.exists(gtf)){
-#   logger::log_warn('Gtf file {gtf} not found. Gene name info will be omitted.')
-#   gene_info <- FALSE
-# } else {
-#   # # Import GTF (only 'gene' rows to save memory) 
-#   # gtf_data <- rtracklayer::import(gtf, feature.type = c("gene") )
-#   # But we do need tx_id too
-#   gtf_data <- rtracklayer::import(gtf, feature.type = c("gene","transcript") )
-#}
 
 
 # Function to add gene info to data.frame or tibble
