@@ -18,6 +18,7 @@ Use the `render_rnasplice_report_default.sh` script as a template. Currently the
 
 ## TODO
 
+-   [ ] add more gc to optimize memory usage
 -   [ ] fix errors when knitting with empty gtf
 -   [ ] add overlap between tools for significant AS *events*
 -   [ ] clean up chunk labels 
