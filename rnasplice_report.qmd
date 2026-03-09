@@ -243,30 +243,23 @@ Methods that use transcript-level quantification from salmon:
 -   **A5SS**: Alternative 5' Splice Site
 -   **RI**: Retained Intron
 
-The statistical model of MATS calculates the P-value and false discovery rate that the difference in the isoform ratio of a gene between two conditions exceeds a given user-defined threshold. An extension of MATS, [rMATS](https://pmc.ncbi.nlm.nih.gov/articles/PMC4280593/), is designed for detection of differential alternative splicing from replicate RNA-Seq data and uses a hierarchical model to simultaneously account for sampling uncertainty in individual replicates and variability among replicates.
+![](images/splicing.jpg)
+
+The statistical model of MATS calculates the P-value and false discovery rate that the difference in the isoform ratio of a gene between two conditions exceeds a given user-defined threshold. An extension of MATS, [rMATS](https://pmc.ncbi.nlm.nih.gov/articles/PMC4280593/), is designed for detection of differential alternative splicing from replicate RNA-Seq data.
+
+From the publication:
+
+- rMATS models alternative splicing events, such as exon inclusion levels ($\psi$), as a hierarchical framework, to account for estimation uncertainty both in individual replicates and among the replicates
+- rMATS uses flexible hypothesis testing where null and alternative hypotheses are defined by user (specifically: likelihood-ratio test that the difference in mean $\psi$ values between the groups exceed user-defined threshold, e.g. $|\Delta\psi| = | \psi_{i1} - \psi_{i2} | > 5\%$)
 
 ![](images/rMATS.jpg)
 
-Where:
-
--   the AS event (e.g. exon inclusion) level $\psi$ is estimated by:
+The AS event (e.g. exon inclusion) level $\psi$ is estimated by:
 
   -   the count of reads specific to the event-containing isoform $I$
 
   -   the count of reads specific to the event excluding isoform $S$
 
-
--   the event inclusion read count I follows a binomial distribution with the total read count $n = I + S$
-
--   the binomial distribution models the estimation uncertainty of $\psi$ as influenced by the total read count n
-
--   the proportion of reads from the event inclusion isoform is represented by the length normalization function 𝑓⁡($\psi$) that normalizes the event inclusion level $\psi$ by the effective lengths of the isoforms (i.e., the number of unique isoform-specific read positions)
-
--   mixed model: the group mean of event inclusion levels of groups 1 and 2 ($\psi_i1$ and $\psi_i2$) is a fixed effect and the variability within a sample group is random effect
-
--   logit transformation of exon inclusion levels in individual replicate $k(\psi_{ijk})$ follows a normal distribution with the logit of the group mean $\psi_ij$ and the group variance $\sigma_ij$
-
--   a likelihood-ratio test whether the difference of the group mean between the two sample groups exceeds a user-defined threshold $c$, against the null hypothesis $|\Delta\psi_i| = |\psi_i1−\psi_i2| \le c$
 
 The default [cutoff](https://nf-co.re/rnasplice/dev/parameters/#rmats_splice_diff_cutoff) used by the nf-core/rnasplice = `0.0001` which is [default in rMATS](https://github.com/Xinglab/rmats-turbo/blob/v4.3.0/README.md#all-arguments) for 0.01% difference.
 
@@ -279,7 +272,10 @@ The default [cutoff](https://nf-co.re/rnasplice/dev/parameters/#rmats_splice_dif
 # The JC files are more strict in that they only count the junction reads which provide better evidence to support the event. 
 # The JCEC files include the additional exon count data which may result in more significant events from the statistical analysis."
 # see diagram https://github.com/Xinglab/rmats-turbo#output
+
 # #TODO potentially include fromGTF.novelSpliceSite and novelJunction events
+# (fromGTF.[AS].txt is event definition file and JC/JCEC are counts files)
+# However they all seem to be empty - check if nf-core included --novelSS option
 
 # Discover contrasts
 rmats_contrasts <- list.files(file.path(base_dir, "star_salmon", "rmats"), pattern = "[^bamlist]") 
@@ -380,8 +376,6 @@ rmats_datas %>%
 ## Top Significant Events by Type
 
  
-
-
 ```{r}
 #| label: rmats-tables
 #| results: asis
@@ -508,12 +502,21 @@ cat(":::\n\n")
 # TODO optimize plotting to not have these objects
 rm(outer_groups, inner_groups, current_data, clean_group, current_data)
 
-
+# upset needs vector of gene ids
+# use a list of lists and unite by event type later
+rmats_for_upset <- rmats_datas %>% 
+  dplyr::filter(FDR < fdrThreshold) %>%
+  dplyr::select(GeneID,event_type,contrast) %>% 
+  #dplyr::group_split(.by = event_type, .keep = FALSE) # there is no naming option in group_split
+  #use base R split
+  { split(., .$event_type) } %>% 
+  purrr::map(~ split(.x$GeneID, .x$contrast))
 
 
 rm(rmats_datas)
 a <- gc()
 ```
+
 
 
 ------------------------------------------------------------------------
@@ -1157,7 +1160,8 @@ suppa_local_datas <- purrr::map(suppa_local_paths, ~ {
     as_tibble() %>%
     dplyr::rename("event_id"="row.names") %>% 
     # Create column for event types
-    mutate(event_type = stringr::str_extract(event_id, "(?<=;)[^:]+(?=:)")) 
+    mutate(event_type = stringr::str_extract(event_id, "(?<=;)[^:]+(?=:)"),
+           gene_id = stringr::str_extract(event_id, "(^.+);",1)) 
 
   # Load PSI vectors
   suppa_psivec <- read.csv(.x$psivec, sep = "\t", row.names=NULL) %>%
@@ -1633,6 +1637,35 @@ cat("\n\n:::\n\n")
 
 ```
 
+```{r}
+#| label: suppa for upset and gc
+
+# upset needs vector of gene ids
+# use a list of lists and unite by event type later
+# suppa is already a list by contrast, we need to invert the list to list by event type first
+# #todo optimize, this takes long as well as original suppa loading
+suppa_for_upset <- suppa_local_datas %>% 
+  # rename all pval columns to a single name
+  map(~ .x %>% 
+    # Rename the column matching the pattern to 'pval'
+    rename_with(~ "pval", contains("_p.val"))
+  ) %>%
+  # bind rows to one tibble
+  bind_rows(.id = "contrast") %>%
+  # extract significant events
+  dplyr::filter(pval < fdrThreshold) %>%
+  # get cols
+  dplyr::select(gene_id,event_type,contrast) %>% 
+  # re-split again
+  { split(., .$event_type) } %>%
+  # nest by contrast
+  purrr::map(~ split(.x$gene_id, .x$contrast))
+  
+# rename list (or later)
+
+rm(suppa_isoform_datas, suppa_local_datas)
+a <- gc()
+```
 
 ------------------------------------------------------------------------
 
@@ -1853,8 +1886,7 @@ IsoformSwitchAnalyzeR [support multiple tools](https://www.bioconductor.org/pack
 IsoformSwitchAnalyzeR performs [alternative splicing analysis](https://www.bioconductor.org/packages/release/bioc/vignettes/IsoformSwitchAnalyzeR/inst/doc/IsoformSwitchAnalyzeR.html#analyzing-alternative-splicing) by lifting over functions from former spliceR package.
 
 ```{r}
-#| label: isofswan-path and default params
-
+#| label: isa-path and default params
 
 
 # IsoformSwitchAnalyzeR paths
@@ -1945,14 +1977,22 @@ splicingEnrichment <- extractSplicingEnrichment(
 ```{r}
 #| label:  transcriptome wide comparison of difference in all events
 # Switch on if there are any significant events identified above #TODO
+
+# Plot all
 extractSplicingGenomeWide(
     isoform_switchlist,
     featureToExtract = 'all',                 # all isoforms stored in the switchAnalyzeRlist
-    splicingToAnalyze = c('A3','MES','ATSS'), # Splice types significantly enriched 
+    splicingToAnalyze = 'all',
+    #     splicingToAnalyze = c('A3','MES','ATSS'), # Splice types significantly enriched 
+    alpha = fdrThreshold,
+    dIFcutoff = effect_size_cutoff,
     plot=TRUE,
-    returnResult=FALSE  # Preventing the summary statistics to be returned as a data.frame
+    returnResult=FALSE   # Preventing the summary statistics to be returned as a data.frame
 )
 ```
+
+
+
 
 ### Isoform Features Table
 
@@ -2066,27 +2106,51 @@ cat(" \n")
 
 
 ```{r}
-#| label: isa cleanup
+#| label: isa upset list and cleanup
 
-# List for upset plots
-isa_for_upset <- isoform_features_data %>% 
-  # Take significant transcripts
-  filter(isoform_switch_q_value<fdrThreshold) %>% 
+# Extract data
+isa_data <- isoform_features_data %>% 
+  # Take significant transcripts or genes
+  filter(gene_switch_q_value<fdrThreshold) %>% 
   # Make a comparison column
   mutate(contrast=paste(condition_1,condition_2,sep="-")) %>% 
+  dplyr::select(-c(IR,gene_id)) %>% 
+  # Add Ensembl gene_id (isa uses gene symbol)
+  dplyr::left_join(tx2gene %>% 
+                     dplyr::select(gene_id, transcript_id) %>% 
+                     distinct() %>% 
+                     na.omit()
+                   , by = join_by(isoform_id==transcript_id))
+
+# List for upset plots DTU on gene level
+isa_for_upset_dtu <- isa_data %>% 
   # Clever trick to make a named list: split first value by second and will make it unique
-  { split(.$isoform_id, .$contrast) }
+  dplyr::select(gene_id, contrast) %>% 
+  distinct() %>% 
+  { split(.$gene_id, .$contrast) }
 
-# Alternative:
-# isa_for_upset <- my_isoform_data %>%
-#   filter(isoform_switch_q_value < 0.05) %>%
-#   group_by(contrast) %>%
-#   group_map(~ .x$isoform_id) %>%
-#   set_names(unique(sort(my_isoform_data$contrast)))
+# List for upset plots event types
+acceptedTypes <- c("A3","A5","ATSS","ATTS","ES" ,"IR","MEE","MES" )
+isa_for_upset_event <- isa_data %>% 
+  left_join(isoform_switchlist$AlternativeSplicingAnalysis
+            , by = 'isoform_id') %>% 
+  pivot_longer(
+      cols = any_of(acceptedTypes),
+      names_to = "event_type",
+      values_to = "count"
+    ) %>%
+  filter(count > 0) %>% # Only keep rows where that event actually occurred
+  dplyr::select(gene_id,event_type,contrast) %>% 
+  distinct() %>% 
+  # re-split again
+  { split(., .$event_type) } %>%
+  # nest by contrast
+  purrr::map(~ split(.x$gene_id, .x$contrast))
 
-rm(isoform_switchlist)
+rm(isoform_switchlist, isoform_features_data, isa_data)
 a <- gc()
 ```
+
 
 
 ------------------------------------------------------------------------
@@ -2097,12 +2161,114 @@ a <- gc()
 
 ```{r}
 #| label: upset plots events
+#| output: asis
+#| echo: false
+
+# TODO: ! also overlap between contrasts
 
 # renv::install('ComplexUpset')
 
 # Events from rMATS, suppa, isoformswitchanalyzer
+# TODO add ensembl gene ids to isa objects
 
-# Also include isoformswitchanalyzer!
+
+# Group by contrast and event type (shared)
+
+# Check contrast names are same
+#all(names(rmats_for_upset$A3SS)%in%names(suppa_for_upset$A3))
+#all(names(rmats_for_upset$A3SS)%in%names(isa_for_upset_event$A3))
+comparisons <- names(rmats_for_upset$A3SS)
+
+
+# Think how to consolidate event types
+#rmats_datas$event_type %>% unique()
+#[1] "SE"   "MXE"  "A3SS" "A5SS" "RI"  
+#suppa_local_datas$`IR_0p5Gy_1h-NO_0p5Gy_nonirr`$event_type %>% unique()
+#[1] "A5" "AF" "SE" "A3" "MX" "RI" "AL"
+# isa_data$AStype %>% unique()
+#[1] "A3"   "A5"   "ATSS" "ATTS" "ES"   "IR"   "MEE"  "MES" 
+
+# Only include what overlaps (potentially underestimating)
+# "AF" = "ATSS"
+# "AL" = "ATTS"
+# "SE" = "ES" ("MES" might be subset as multi-exon skipping)
+# "RI" = "IR"
+# "MX" = "MXE" = "MEE"
+
+event_types = c("Alternative_3SS",
+                "Alternative_5SS",
+                "Exon_Skipping",
+                "Mutually_Exclusive_Exons",
+                "Retained_Intron")
+
+# Rename to meaningful names
+names(rmats_for_upset) %<>% replace_when(
+  . == "A3SS" ~ "Alternative_3SS",
+  . == "A5SS" ~ "Alternative_5SS",
+  . == "SE" ~ "Exon_Skipping",
+  . == "MXE" ~ "Mutually_Exclusive_Exons",
+  . == "RI" ~ "Retained_Intron"
+)
+
+names(suppa_for_upset) %<>% replace_when(
+  . == "A3" ~ "Alternative_3SS",
+  . == "A5" ~ "Alternative_5SS",
+  . == "AF" ~ "Alternative_First",
+  . == "AL" ~ "Alternative_Last",
+  . == "SE" ~ "Exon_Skipping",
+  . == "MX" ~ "Mutually_Exclusive_Exons",
+  . == "RI" ~ "Retained_Intron"
+)
+
+names(isa_for_upset_event) %<>% replace_when(
+  . == "A3" ~ "Alternative_3SS",
+  . == "A5" ~ "Alternative_5SS",
+  . == "ATSS" ~ "Alternative_First",
+  . == "ATTS" ~ "Alternative_Last",
+  . %in% c("MES","ES") ~ "Exon_Skipping",
+  . == "MEE" ~ "Mutually_Exclusive_Exons",
+  . == "IR" ~ "Retained_Intron"
+)
+
+
+
+# 1. List for overlap between the tools for each event type and contrast
+# Apparently there are too few events or an overlap
+# event_hits_lists <- purrr::map(event_types,  ~{
+#   # .x = event type
+#   purrr::map(comparisons, \(comp){
+#       return(as.data.frame(
+#         UpSetR::fromList(
+#           list(
+#             rMATS = rmats_for_upset[[.x]][[comp]],
+#             SUPPA = suppa_for_upset[[.x]][[comp]]
+#             #isofSwAn = isa_for_upset_event[[.x]][[comp]],
+#   ))))
+#   })
+# })
+# 
+
+# 2. List for overlap between the contrasts within each event type and tool
+event_list_rmats <- purrr::map(rmats_for_upset,  ~{
+  # within each type: have a list per contrast
+  as.data.frame(
+    UpSetR::fromList(.x))
+})
+  
+cat('\n\n### rMATS\n\n')
+
+cat('\n\n::: {.panel-tabset}\n\n')
+
+# upset plots
+iwalk(event_list_rmats, ~{
+  cat('###', .y, '\n\n')
+  # print(ComplexUpset::upset(.x,
+  #                           intersect = colnames(.x)))
+  print(UpSetR::upset(.x))
+  cat('\n\n')
+})
+
+cat('\n\n:::\n\n')
 ```
 
 
@@ -2138,7 +2304,8 @@ cat('\n\n::: {.panel-tabset}\n\n')
 # upset plots
 iwalk(deu_hits_lists, ~{
   cat('###', .y, '\n\n')
-  print(ComplexUpset::upset(.x, intersect = c('DEXseq', 'edgeR')))
+  #print(ComplexUpset::upset(.x, intersect = c('DEXseq', 'edgeR')))
+  print(UpSetR::upset(.x))
   cat('\n\n')
 })
 
@@ -2189,7 +2356,9 @@ cat('\n\n::: {.panel-tabset}\n\n')
 # upset plots # todo make a function of hits list
 iwalk(dtu_hits_lists, ~{
   cat('###', .y, '\n\n')
-  print(ComplexUpset::upset(.x, intersect = c('stageR', 'IsoformSA')))
+  #print(ComplexUpset::upset(.x, intersect = c('stageR', 'IsoformSA')))
+  #broken in newer ggplot - this open PR should fix https://github.com/krassowski/complex-upset/pull/217
+  print(UpSetR::upset(.x))
   cat('\n\n')
 })
 
