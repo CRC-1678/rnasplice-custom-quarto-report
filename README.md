@@ -18,10 +18,9 @@ Use the `render_rnasplice_report_default.sh` script as a template. Currently the
 
 ## TODO
 
--   [ ] add more gc to optimize memory usage
+-   [X] add overlap between tools for significant AS *events*
 -   [ ] fix errors when knitting with empty gtf
--   [ ] add overlap between tools for significant AS *events*
 -   [ ] clean up chunk labels 
--   [ ] make html tables uniformly formatted throughout
+-   [X] make html tables uniformly formatted throughout
 -   [ ] make adjustable figsize for all faceted plots based on the number of samples
 -   [ ] add more `logger::log_info` messages

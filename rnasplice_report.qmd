@@ -165,8 +165,12 @@ if (!is.null(gtf) && nzchar(gtf) && file.exists(gtf)) {
     distinct()
   
   # Smaller df for only genes:
-  gene_map <- tx2gene %>% dplyr::select(gene_id, gene_name, gene_biotype) %>% distinct()
-
+  gene_map <- tx2gene %>%
+    dplyr::select(gene_id, gene_name, gene_biotype) %>%
+    distinct() %>% 
+  # If gene name is misisng, still supply gene_id to avoid NA
+    mutate(gene_name = replace_values(gene_name, NA ~ gene_id))
+  
   # Remove large object and free memory
   rm(gtf_data)
   a <- gc()
@@ -247,19 +251,20 @@ Methods that use transcript-level quantification from salmon:
 
 The statistical model of MATS calculates the P-value and false discovery rate that the difference in the isoform ratio of a gene between two conditions exceeds a given user-defined threshold. An extension of MATS, [rMATS](https://pmc.ncbi.nlm.nih.gov/articles/PMC4280593/), is designed for detection of differential alternative splicing from replicate RNA-Seq data.
 
-From the publication:
-
-- rMATS models alternative splicing events, such as exon inclusion levels ($\psi$), as a hierarchical framework, to account for estimation uncertainty both in individual replicates and among the replicates
-- rMATS uses flexible hypothesis testing where null and alternative hypotheses are defined by user (specifically: likelihood-ratio test that the difference in mean $\psi$ values between the groups exceed user-defined threshold, e.g. $|\Delta\psi| = | \psi_{i1} - \psi_{i2} | > 5\%$)
-
-![](images/rMATS.jpg)
-
 The AS event (e.g. exon inclusion) level $\psi$ is estimated by:
 
   -   the count of reads specific to the event-containing isoform $I$
 
   -   the count of reads specific to the event excluding isoform $S$
 
+
+![](images/rMATS.jpg)
+
+
+From the publication:
+
+- rMATS models alternative splicing events, such as exon inclusion levels ($\psi$), as a hierarchical framework, to account for estimation uncertainty both in individual replicates and among the replicates
+- rMATS uses flexible hypothesis testing where null and alternative hypotheses are defined by user (specifically: likelihood-ratio test that the difference in mean $\psi$ values between the groups exceed user-defined threshold, e.g. $|\Delta\psi| = | \psi_{i1} - \psi_{i2} | > 5\%$)
 
 The default [cutoff](https://nf-co.re/rnasplice/dev/parameters/#rmats_splice_diff_cutoff) used by the nf-core/rnasplice = `0.0001` which is [default in rMATS](https://github.com/Xinglab/rmats-turbo/blob/v4.3.0/README.md#all-arguments) for 0.01% difference.
 
@@ -318,6 +323,8 @@ rmats_datas <- imap_dfr(
     }
 
     d %>%
+      # Remove ID
+      dplyr::select(-any_of(starts_with("ID.."))) %>% 
       #filter(FDR < fdrThreshold) %>%
       mutate(
         contrast = .y,
@@ -371,67 +378,76 @@ rmats_datas %>%
 ```
 
 
+## Significant Events by Type
 
 
-## Top Significant Events by Type
-
- 
 ```{r}
 #| label: rmats-tables
 #| results: asis
 #| echo: false
 
+#TODO add description of all columns https://www.biostars.org/p/256949/#274010
+
 cat("::: {.panel-tabset}\n\n")
 
 # Split the tibble by the outer grouping by contrast
-outer_groups <- rmats_datas %>%
+rmats_datas %>%
   filter(FDR < fdrThreshold) %>% # only take significant events
-  dplyr::group_split(contrast)
-
-
-for (group_i in outer_groups) {
-  cntr <- unique(group_i$contrast)
-
-  # Start outer tab
-  cat("\n###", as.character(cntr), "{.panel-tabset}\n\n")
+  dplyr::group_split(contrast) %>% 
   
-  # Make inner groups by event type
-  inner_groups <- group_i %>% group_split(event_type)
-  
-  # Loop through each group
-  for (i in seq_along(inner_groups)) {
+  # Print tables of top events for each contrast
+  purrr::walk( ~{
     
-    current_data <- inner_groups[[i]]
+    # Extract contrast name
+    cntr <- unique(.x$contrast)
     
-    # Check if the group is empty
-    if (nrow(current_data) == 0) next
+    # Start outer tab
+    cat("\n###", as.character(cntr), "{.panel-tabset}\n\n")
     
-    # Get the group name for the tab title
-    tab_title <- unique(current_data$event_type)
-    
-    # Drop columns that are all NA for group
-    clean_group <- current_data %>% 
-      dplyr::select(where(~ !all(is.na(.))))
-    
-    # Start inner tab
-    cat("\n####", as.character(tab_title), "\n\n")
-    
-    
-    # Print interactive html table only if not empty
-    if(nrow(clean_group) > 0) {
-      widget <- datatable(clean_group
-                          , options = list(pageLength = 5, dom = 'tip', scrollX = TRUE)
-                          , elementId = paste0("table_", i))
-      cat(htmltools::renderTags(widget)$html)
-    } else {
-      cat("No data for this combination.")
-    }
-    
-    # Add extra newlines so the next header is recognized
-    cat("\n\n")
-  }
+    # Make inner groups by event type
+    .x %>%
+      group_split(event_type) %>% 
+      
+      # Loop through each group
+      purrr::iwalk( ~{
+        
+        # Check if the group is empty
+        if (nrow(.x) == 0) return(NULL)
+        
+        # Get the group name for the tab title
+        tab_title <- unique(.x$event_type)
+        
+        # Start inner tab
+        cat("\n####", as.character(tab_title), "\n\n")
+        
+        .x %>% 
+          # Drop columns that are all NA for group
+          dplyr::select(where(~ !all(is.na(.)))) %>% 
+          # Print interactive html table only if not empty
+          {if(nrow(.) > 0) {
+            
+            widget <- datatable(.,
+                                extensions = 'Buttons',
+                                options = list(
+                                  pageLength = 5,
+                                  dom = 'Blfrtip',
+                                  scrollX = TRUE,
+                                  autoWidth = TRUE,
+                                  buttons = c('copy', 'csv', 'excel')
+                                  ), elementId = paste0("table_", .y))%>%
+              # Use Scientific Notation for P-values to avoid "0.000"
+              formatSignif(columns = c('PValue','FDR'), digits = 3)
+            
+            cat(htmltools::renderTags(widget)$html)
+            } else {
+              cat("No data for this combination.")
+            }
+          }
+        # Add extra newlines so the next header is recognized
+        cat("\n\n")
+      })
 
-}
+  })
 
 cat(":::\n\n")
 ```
@@ -442,35 +458,47 @@ cat(":::\n\n")
 
 ```{r}
 #| label: rmats-volcanoplots
-#| fig-cap: "rMATS Volcano Plots."
 #| results: asis
 #| echo: false
+##| fig-cap: "rMATS Volcano Plots."
+
+
+# Consistent manual color scheme for rMATS event types
+rmats_colors <- c(
+  "SE"   = "#66C2A5", # Greenish
+  "RI"   = "#FC8D62", # Orange
+  "MXE"  = "#8DA0CB", # Blue-ish
+  "A5SS" = "#E78AC3", # Pink
+  "A3SS" = "#A6D854"  # Light Green
+)
+
 
 # Create volcano plots for each contrast showing all event types
 
 cat("::: {.panel-tabset}\n\n")
 
-# Use outer groups generated previously
-
-  # Loop through each group
-  for (i in seq_along(outer_groups)) {
+rmats_datas %>%
+  dplyr::group_split(contrast) %>% 
+  
+  # Print tables of top events for each contrast
+  purrr::walk( ~{
     
-    current_data <- outer_groups[[i]]
+    # Extract contrast name
+    cntr <- unique(.x$contrast)
     
     # Check if the group is empty
-    if (nrow(current_data) == 0) next
-    
-    # Get the group name for the tab title
-    tab_title <- unique(current_data$contrast)
+    if (nrow(.x) == 0) return(NULL)
     
     # Start inner tab
-    cat("\n####", as.character(tab_title), "\n\n")
+    cat("\n####", as.character(cntr), "\n\n")
+    
+    # Mark top N genes
+    tolabel <- .x %>% slice_min(order_by = FDR, n=10, with_ties = FALSE, na_rm = TRUE)
     
     # Volcano plot of all events
-    p <- ggplot(current_data, aes(x = IncLevelDifference, y = -log10(FDR), color = event_type)) +
+    p <- ggplot(.x, aes(x = IncLevelDifference, y = -log10(FDR), color = event_type)) +
       geom_point(alpha = 0.6, size = 2) +
       geom_hline(yintercept = -log10(fdrThreshold), linetype = "dashed", color = "red") +
-      scale_color_brewer(palette = "Set2") +
       labs(
         title = paste("Volcano Plot of Alternative Splicing Events"),
         subtitle = paste("FDR <", fdrThreshold, "threshold shown as red dashed line"),
@@ -483,12 +511,22 @@ cat("::: {.panel-tabset}\n\n")
         plot.title = element_text(face = "bold", hjust = 0.5),
         plot.subtitle = element_text(hjust = 0.5),
         legend.position = "right"
-      )
+      ) + 
+      ggrepel::geom_label_repel(data = tolabel,
+                                  aes(label = geneSymbol),
+                                  show.legend = FALSE,
+                                  size = 4,
+                                  force = 10,
+                                  box.padding = 0.5,
+                                  point.padding = 0.3,
+                                  max.overlaps = Inf) +
+      scale_color_manual(values = rmats_colors)
+
 
     print(p)
     # Add extra newlines so the next header is recognized
     cat("\n\n")
-  }
+  })
 
   
 cat(":::\n\n")
@@ -498,9 +536,6 @@ cat(":::\n\n")
 
 ```{r}
 #| label: rmats for upset and gc
-
-# TODO optimize plotting to not have these objects
-rm(outer_groups, inner_groups, current_data, clean_group, current_data)
 
 # upset needs vector of gene ids
 # use a list of lists and unite by event type later
@@ -526,34 +561,19 @@ a <- gc()
 
 [DEXSeq](https://pmc.ncbi.nlm.nih.gov/articles/PMC3460195/) uses generalized linear models to identify differential exon usage from RNA-Seq data by testing whether the usage of individual exons changes between experimental conditions.
 
-As in DESeq2, counts are modeled to follow a negative binomial distribution. The model used is:
-
-$$
-\log \mu_{ijl}=\beta_{i}^{G}+\beta_{il}^{E}+\beta_{i\rho_{j}}^{C}+\beta_{i\rho_{j}l}^{EC}
-$$
+The counts are modeled to follow a negative binomial distribution.
 
 The data structure for the model is a flattened gene model where counting bins (dark grey) are either exons or a unique parts of an exon (in case of overlapping exons).
 
 ![](images/dexseq.jpg)
 
-| Term                      | Description                | Interpretation                                                                                                                              |
-|:-----------------------|:-----------------------|:-----------------------|
-| $\log \mu_{ijl}$        | **Log-transformed mean**   | The natural logarithm of the expected value of the read counts falling into bin $l$ of gene $i$ in sample $j$.                              |
-| $\beta_{i}^{G}$         | **Main effect G**          | Baseline expression of gene $i$.                                                                                                            |
-| $\beta_{il}^{E}$        | **Main effect E**          | The (up to an additive constant) the logarithm of the expected fraction of the reads mapped to gene $i$ that overlap with counting bin $l$. |
-| $\beta{i\rho{j}}^{C}$   | **Main effect C (nested)** | The logarithm of the fold change in overall expression of gene $i$ under condition $\rho_j$ (the experimental condition of sample $j$).    |
-| $\beta{i\rho{j}l}^{EC}$ | **Interaction effect EC**  | The effect that condition $\rho_j$ has on the fraction of reads falling into bin $l$.                                                      |
-
-Analysis of deviance is used to test for each counting bin against the null hypothesis that "the fraction of reads overlapping with a counting bin $l$, of all the reads overlapping with the gene, does not change between conditions." (see publication for details).
-
-In other words, within rnasplice pipeline, we compare a generalized linear model with the formula `~sample + exon + condition:exon` to the smaller null model `~ sample + exon`.
+The likelihood ratio test is performed comparing the full generalized linear model with the formula `~sample + exon + condition:exon` to the reduced null model `~ sample + exon`.
 
 Output files:
 
-
  - DEXSeqDataSet.{contrast}.rds: DEXSeqDataSet R object.
- - DEXSeqResults.{contrast}.rds: DEXSeqResults R object following DEXSeq::DEXSeqResults containing results.
- - DEXSeqResults.{contrast}.csv: CSV results table of DEXSeq DEU analysis featuring log2foldchanges and p-values etc.
+ - DEXSeqResults.{contrast}.rds: DEXSeqResults R object following `DEXSeq::DEXSeqResults()` call (contains results).
+ - DEXSeqResults.{contrast}.csv: CSV results table of DEXSeq DEU analysis with log2foldchanges and p-values.
  - perGeneQValue.{contrast}.rds: DEXSeq R Object following DEXSeq::perGeneQValue containing q-values per gene.
  - perGeneQValue.{contrast}.csv: CSV file of q-values for perGeneQValue.*.rds R Object.
  - plotDEXSeq.{contrast}.pdf : PDF file of top N genes from DEXSeq results.
@@ -637,6 +657,8 @@ cat(" \n")
 
 ## Summary Statistic
 
+This table shows number of significant exons per comparison and number of unique genes to which these exons belong.
+
 ```{r}
 #| label: dexseq-summary-tables
 #| eval: !expr any_dexseq_loaded
@@ -653,9 +675,6 @@ knitr::kable(
                ,number_sign_genes=n_distinct(groupID[padj.exon < 0.05]),
                , .groups = "drop"))
 )
-
-
-
 ```
 
  
@@ -665,12 +684,12 @@ knitr::kable(
 
  
 
-```{r, fig.width=10, fig.height=7}
+```{r}
 #| label: dexseq-volcano-plots
 #| eval: !expr any_dexseq_loaded
 #| output: asis
 #| echo: false
-
+# fig.width=10, fig.height=7
 
 cat("\n\n::: {.panel-tabset} \n\n")
 
@@ -698,6 +717,11 @@ purrr::iwalk(dexseq_datas, ~ {
           )
         )
       
+      # 10 genes to label
+      label_data <- volcano_data %>%
+        filter(significance=="Significant & Large Effect") %>%
+        slice_min(order_by=padj.exon, n=10)
+      
       p <- ggplot(volcano_data, aes(x = !!sym(log2fc_col), y = neg_log10_padj, color = significance)) +
         geom_point(alpha = 0.5, size = 1.5) +
         scale_color_manual(values = c(
@@ -719,7 +743,15 @@ purrr::iwalk(dexseq_datas, ~ {
           legend.position = "bottom",
           plot.title = element_text(face = "bold", hjust = 0.5),
           plot.subtitle = element_text(hjust = 0.5)
-        )
+        ) +
+        ggrepel::geom_label_repel(data=label_data,
+                                  aes(label = gene_name),
+                                  show.legend = FALSE,
+                                  max.overlaps = Inf,    # This forces all labels to show
+                                  force = 10,            # Higher "push" to get labels away from dense point clusters
+                                  box.padding = 0.5      # Give labels more room to breathe
+                                  )
+      
       #TODO fix interactivity
       #print(ggplotly(p, tooltip = c("x", "y", "colour")))
       #print(p)
@@ -735,15 +767,14 @@ purrr::iwalk(dexseq_datas, ~ {
 cat("\n\n:::\n\n")
 ```
 
- 
 
-## Top Differentially Used Exons
+## Differentially Used Exons
 
 ```{r}
 #| label: htmltools init dexseq
 #| include: false
 # Init Step to make sure that the dependencies are loaded
-htmltools::tagList(datatable(mtcars %>% head(0)))
+#htmltools::tagList(datatable(mtcars %>% head(0)))
 ```
 
 
@@ -780,26 +811,38 @@ purrr::iwalk(dexseq_datas, ~ {
     dexseq_display <- .x %>%
       filter(padj.exon < fdrThreshold) %>% 
       arrange(padj.exon) %>%
-      head(topN) %>%
+      #head(topN) %>% #just output all significant
       dplyr::select(any_of(c("featureID", "exonBaseMean", log2fc_col, "pvalue", "padj.exon", "geneID", "exonID", "genomicData.seqnames", "genomicData.start", "genomicData.end", "groupID")))
     
+
     # Rename columns for clarity
     if (ncol(dexseq_display) > 0) {
       colnames(dexseq_display) <- gsub("genomicData\\.", "", colnames(dexseq_display))
-      #colnames(dexseq_display) <- gsub("\\.", "_", colnames(dexseq_display))
       
-      # print(kable(dexseq_display,
-      #             caption = paste("Top", topN,  "Differentially Used Exons -", .y),
-      #             digits = 4))
+      # Select numeric and pvalue cols for rounding
+      # Get all numeric columns
+      all_num_cols <- dexseq_display %>% dplyr::select(where(is.numeric)) %>% names()
+        
+      # Separate P-value-like columns from the rest
+      p_cols <- grep("pvalue|padj|fdr", all_num_cols, ignore.case = TRUE, value = TRUE)
+      other_nums <- setdiff(all_num_cols, p_cols)
       
-      print(htmltools::tagList(datatable(dexseq_display
-                                         , options = list(
-                                           pageLength = 5
-                                           , dom = 'tip'
-                                           , scrollX = TRUE
-                                           ,autoWidth = TRUE
-                                           ,buttons = c('copy', 'csv', 'excel')
-                                           ))))
+      # Print interactive html table only if not empty
+      widget <- datatable(dexseq_display,
+                                extensions = 'Buttons',
+                                options = list(
+                                  pageLength = 10,
+                                  dom = 'Blfrtip',
+                                  scrollX = TRUE,
+                                  autoWidth = TRUE,
+                                  buttons = c('copy', 'csv', 'excel')
+                                  ), elementId = paste0("table_", .y)) %>%
+        # Round numeric columns
+        formatRound(columns = other_nums, digits = 3) %>%
+        # Use Scientific Notation for P-values to avoid "0.000"
+        formatSignif(columns = p_cols, digits = 3)
+    
+      cat(htmltools::renderTags(widget)$html)
     }
     
     cat("\n\n")
@@ -811,8 +854,6 @@ cat("\n\n:::\n\n")
 
  
 
-
- 
 ## Exon Usage Distribution
 
 
@@ -831,12 +872,14 @@ purrr::iwalk(dexseq_datas, ~ {
     # Count significant exons per gene
     exons_per_gene <- .x %>%
       filter(padj.exon < fdrThreshold) %>%
-      dplyr::count(groupID, name = "n_significant_exons") %>%  # group_by + summarise(n())
+      dplyr::count(gene_name, name = "n_significant_exons") %>%  # group_by + summarise(n())
       arrange(desc(n_significant_exons)) %>%
-      # Make short ID which won't break plots - only first gene name (they are separated by "+" sign)
       mutate(
-        shortID = str_remove(groupID, "\\+.+"),
-        shortID = forcats::fct_reorder(shortID, n_significant_exons)
+      # Make short ID which won't break plots - only first gene name (they are separated by "+" sign)
+      #   shortID = str_remove(groupID, "\\+.+"),
+      #   shortID = forcats::fct_reorder(shortID, n_significant_exons)
+      # Arrange again by n exons
+        gene_name = forcats::fct_reorder(gene_name, n_significant_exons)
       )
   
     if (nrow(exons_per_gene) == 0) {
@@ -848,14 +891,14 @@ purrr::iwalk(dexseq_datas, ~ {
     
     top_genes <- head(exons_per_gene, 20)
   
-    p <- ggplot(top_genes, aes(x = shortID, y = n_significant_exons)) +
+    p <- ggplot(top_genes, aes(x = gene_name, y = n_significant_exons)) +
       geom_col(fill = "#377eb8", alpha = 0.8) +
       geom_text(aes(label = n_significant_exons), hjust = -0.3, size = 3.5) +
       coord_flip() +
       labs(
         title = paste("Top 20 Genes by Number of Differentially Used Exons -", .y),
         subtitle = "Genes with most significant exons (padj < 0.05)",
-        x = "Gene ID",
+        x = "Gene name",
         y = "Number of Significant Exons"
       ) +
       theme_minimal(base_size = 12) +
@@ -896,6 +939,10 @@ a <- gc() # assign output to variable to silence it
 
 [edgeR](https://bioconductor.org/packages/release/bioc/html/edgeR.html) performs differential expression analysis at the exon or gene level to identify changes in expression between conditions.
 
+edgeR also uses [negative binomial generalized linear model](https://academic.oup.com/nar/article/53/2/gkaf018/7973897) to model read counts. In case of DEU analysis,
+
+> "NB GLMs are fitted to the exon counts and exon-level NB-dispersions are estimated, as would be done for a gene-level analysis but at the exon level."
+
 Outputs:
 
 - DGEList.rds and DGEGLM.rds R objects - contain the first steps of the edgeR analysis
@@ -908,7 +955,7 @@ From [edgeR User’s Guide](https://bioconductor.org/packages/release/bioc/vigne
 
   > Two different methods can be used to examine the differential splicing results at the gene level: the Simes' method and the gene-level F-test. The Simes' method is likely to be more powerful when only a minority of the exons for a gene are differentially spliced. The F-tests are likely to be powerful for genes in which several exons are differentially spliced.
 
-See [nf-core script](https://github.com/nf-core/rnasplice/blob/dev/bin/run_edger_exon.R) for more details.
+See [nf-core script](https://github.com/nf-core/rnasplice/blob/dev/bin/run_edger_exon.R) for more details of the analysis performed by rnasplice pipeline.
 
 ```{r}
 #| label: edger-paths
@@ -948,7 +995,7 @@ knitr::kable(overview)
 # Trick to include datatable in tabsets
 # https://github.com/simoncoulombe/snippets_quarto/blob/main/posts/2024-05-11-how-to-loop-stuff-in-tabset--quarto-edition/index.qmd
 # Init Step to make sure that the dependencies are loaded
-htmltools::tagList(datatable(mtcars %>% head(0)))
+#htmltools::tagList(datatable(mtcars %>% head(0)))
 ```
 
 ```{r}
@@ -956,7 +1003,7 @@ htmltools::tagList(datatable(mtcars %>% head(0)))
 #| output: asis
 #| echo: false
 # Put both p-values together and plot against each other
-# TODO add labels once gene names included
+# TODO iwalk
 
 cat(":::: {.panel-tabset} \n\n")
 
@@ -989,8 +1036,24 @@ for (cn in contrast_names) {
 
   ## ---- Gene-level table ----
   cat("### Gene-level summary\n\n")
-  
-  print(htmltools::tagList(datatable(gene_res, options = list(pageLength = 10))))
+  widget <- datatable(gene_res,
+                                extensions = 'Buttons',
+                                options = list(
+                                  pageLength = 10,
+                                  dom = 'Blfrtip',
+                                  scrollX = TRUE,
+                                  autoWidth = TRUE,
+                                  buttons = c('copy', 'csv', 'excel')
+                                  ), elementId = paste0("table_", cn)) %>% 
+    # Round standard numbers (LFC, Difference, etc.)
+    formatRound(columns = c('gene.F'), digits = 3) %>%
+    # Use Scientific Notation for P-values to avoid "0.000"
+    formatSignif(columns = c('P.Value.gene',
+                             'FDR.gene',
+                             'P.Value.simes',
+                             'FDR.simes'), digits = 3)
+
+  cat(htmltools::renderTags(widget)$html)
   
   cat("\n\n")
 
@@ -1013,6 +1076,7 @@ for (cn in contrast_names) {
         data = top_genes,
         aes(label = gene_name),
         size = 4,
+        force=10,
         box.padding = 0.5,
         point.padding = 0.3,
         max.overlaps = Inf)
@@ -1044,7 +1108,7 @@ a <- gc() # assign output to variable to silence it
 
 # SUPPA - Percentage Spliced In (PSI) based Differential Splicing Events {#suppa}
 
-[SUPPA](https://www.ncbi.nlm.nih.gov/pubmed/26179515) (Study Percentage Spliced-In) quantifies alternative splicing using Percentage Spliced In (PSI) values and identifies differential splicing events between conditions.
+[SUPPA](https://www.ncbi.nlm.nih.gov/pubmed/26179515) quantifies alternative splicing using Percentage Spliced In (PSI) values and identifies differential splicing events between conditions.
 
 ![](images/suppa.jpg)
 
@@ -1055,19 +1119,18 @@ $$
 $$ 
 
 
-SUPPA then outputs events that are differentially spliced between a pair of conditions and also performs clustering of the events which behave similarly across conditions. It estimates the significant differential splicing events by evaluating the difference in Percent Spliced In (PSI) values between conditions, relative to the biological variability observed between replicates. See [github repository](https://github.com/comprna/SUPPA?tab=readme-ov-file) for details.
+SUPPA outputs events that are differentially spliced between a pair of conditions and performs clustering of the events which behave similarly across conditions. It estimates the significant differential splicing events by evaluating the difference in Percent Spliced In (PSI) values between conditions, relative to the biological variability observed between replicates. See [github repository](https://github.com/comprna/SUPPA?tab=readme-ov-file) for details.
 
 Output files:
 
--   dPSI - a tab-separated file, "with the (transcript or local) event ID in the first column, followed by a variable even number of fields, two for each pair of conditions being compared":
-
-  -   Cond1_Cond2_dPSI: Event PSI difference (ΔPSI) between Cond1 and Cond2 (ΔPSI = PSI_2 - PSI_1).
-  -   Cond1_Cond2_pvalue: Significance of the difference of PSI between Cond1 and Cond2
+  -   dPSI - a tab-separated file, "with the (transcript or local) event ID in the first column, followed by a variable even number of fields, two for each pair of conditions being compared":
+      -   Cond1_Cond2_dPSI: Event PSI difference (ΔPSI) between Cond1 and Cond2 (ΔPSI = PSI_2 - PSI_1).
+      -   Cond1_Cond2_pvalue: Significance of the difference of PSI between Cond1 and Cond2
 
 -   psivec - a tab separated file, "with the (transcript or local) event ID in the first column, followed by a variable number of fields, each giving the PSI value per replicate":
-  - sample PSI: PSI value for a given replicate/condition.
+      - sample PSI: PSI value for a given replicate/condition.
 
-"The local alternative splicing events are standard local splicing variations (see below), whereas a transcript event is an isoform-centric approach, where each isoform in a gene is described separately."
+> "The local alternative splicing events are standard local splicing variations, whereas a transcript event is an isoform-centric approach, where each isoform in a gene is described separately."
 
 Different local event types generated by SUPPA:
 
@@ -1161,7 +1224,10 @@ suppa_local_datas <- purrr::map(suppa_local_paths, ~ {
     dplyr::rename("event_id"="row.names") %>% 
     # Create column for event types
     mutate(event_type = stringr::str_extract(event_id, "(?<=;)[^:]+(?=:)"),
-           gene_id = stringr::str_extract(event_id, "(^.+);",1)) 
+           gene_id = stringr::str_extract(event_id, "(^.+);",1),
+           # genes are still separated by _and_ so we take first gene id
+           first_gene_id = stringr::str_extract(event_id, "^[^;_]+")
+           ) 
 
   # Load PSI vectors
   suppa_psivec <- read.csv(.x$psivec, sep = "\t", row.names=NULL) %>%
@@ -1270,47 +1336,7 @@ cat("\n\n:::\n\n")
 #| label: suppa-top-events-tables
 #| results: asis
 #| echo: false
-# blocks <- list()
-# 
-# for (i in seq_along(suppa_all_contrasts)) {
-# 
-#   x <- suppa_all_contrasts[[i]]
-#   y <- suppa_datas[[i]]
-# 
-#   if (y$suppa_loaded && !is.null(y$suppa_sig)) {
-# 
-#     # HTML header (NOT markdown)
-#     blocks[[length(blocks) + 1]] <-
-#       tags$h3(paste0(x, " (", y$analysis_type, ")"))
-# 
-#     suppa_display <- y$suppa_sig |>
-#       arrange(!!sym(y$pval_col)) |>
-#       head(50)
-# 
-#     if (y$analysis_type == "local") {
-#       suppa_display <- suppa_display |>
-#         mutate(
-#           event_type = stringr::str_extract(event_id, "(?<=;)[^:]+(?=:)"),
-#           gene_id   = stringr::str_extract(event_id, "^[^;]+")
-#         ) |>
-#         dplyr::select(event_id, gene_id, event_type, everything())
-#     }
-# 
-#     # DT table
-#     blocks[[length(blocks) + 1]] <-
-#       create_interactive_table(
-#         suppa_display,
-#         caption = paste(
-#           "Top 50 Significant Differential Splicing Events -", x
-#         )
-#       )
-#   }
-# }
-# 
-# # Return ONE html object
-# tagList(blocks)
 
-# new code #
 
 # Make separate tabsets for local and isoform events
 
@@ -1358,13 +1384,17 @@ iwalk(suppa_local_datas, ~{
     
     # Print interactive html table only if not empty
     if(nrow(clean_group) > 0) {
-      widget <- datatable(clean_group
-                          , options = list(pageLength = 5
-                                           , dom = 'tip'
-                                           , scrollX = TRUE
-                                           ,autoWidth = TRUE
-                                           ,buttons = c('copy', 'csv', 'excel'))
-                          , elementId = paste0("table_", i))
+      widget <-  datatable(clean_group,
+                                extensions = 'Buttons',
+                                options = list(
+                                  pageLength = 10,
+                                  dom = 'Blfrtip',
+                                  scrollX = TRUE,
+                                  autoWidth = TRUE,
+                                  buttons = c('copy', 'csv', 'excel')
+                                  ), elementId = paste0("table_", .y)) %>%
+        # Use Scientific Notation for P-values to avoid "0.000"
+        formatSignif(columns = pval_col, digits = 3)
       cat(htmltools::renderTags(widget)$html)
     } else {
       cat("No data for this combination.")
@@ -1379,52 +1409,6 @@ iwalk(suppa_local_datas, ~{
 
 cat("\n\n:::\n\n")
 
-
-# for (group_i in outer_groups) {
-#   cntr <- unique(group_i$contrast)
-# 
-#   # Start outer tab
-#   cat("\n###", as.character(cntr), "{.panel-tabset}\n\n")
-#   
-#   # Make inner groups by event type
-#   inner_groups <- group_i %>% group_split(event_type)
-#   
-#   # Loop through each group
-#   for (i in seq_along(inner_groups)) {
-#     
-#     current_data <- inner_groups[[i]]
-#     
-#     # Check if the group is empty
-#     if (nrow(current_data) == 0) next
-#     
-#     # Get the group name for the tab title
-#     tab_title <- unique(current_data$event_type)
-#     
-#     # Drop columns that are all NA for group
-#     clean_group <- current_data %>% 
-#       dplyr::select(where(~ !all(is.na(.))))
-#     
-#     # Start inner tab
-#     cat("\n####", as.character(tab_title), "\n\n")
-#     
-#     
-#     # Print interactive html table only if not empty
-#     if(nrow(clean_group) > 0) {
-#       widget <- datatable(clean_group
-#                           , options = list(pageLength = 5, dom = 'tip', scrollX = TRUE)
-#                           , elementId = paste0("table_", i))
-#       cat(htmltools::renderTags(widget)$html)
-#     } else {
-#       cat("No data for this combination.")
-#     }
-#     
-#     # Add extra newlines so the next header is recognized
-#     cat("\n\n")
-#   }
-# 
-# }
-# 
-# cat(":::\n\n")
 ```
 
 
@@ -1565,13 +1549,16 @@ purrr::iwalk(suppa_isoform_datas, ~ {
             plot.title = element_text(face = "bold", hjust = 0.5),
             plot.subtitle = element_text(hjust = 0.5)
           ) +
-        ggrepel::geom_text_repel(
+        ggrepel::geom_label_repel(
           data = top_genes,
           aes(label = gene_name),
           size = 4,
+          force=10,
           box.padding = 0.5,
           point.padding = 0.3,
-          max.overlaps = Inf)
+          max.overlaps = Inf,
+          show.legend = FALSE
+          )
       
       #print(ggplotly(p, tooltip = c("x", "y", "colour")))
       print(p)
@@ -1616,14 +1603,20 @@ iwalk(suppa_isoform_datas, ~{
   # Print interactive html table only if not empty
   # Only take significant events
   if(nrow(.x) > 0) {
-      widget <- datatable(.x %>% filter(!!sym(pval_col) < fdrThreshold) 
-                          , options = list(pageLength = 5
-                                           , dom = 'tip'
+      widget <- datatable(.x %>% filter(!!sym(pval_col) < fdrThreshold) ,
+                          extensions = 'Buttons',
+                          options = list(pageLength = 10
+                                           , dom = 'Blfrtip'
                                            , scrollX = TRUE
                                            ,autoWidth = TRUE
                                            ,buttons = c('copy', 'csv', 'excel'))
-                          , elementId = paste0("table_", i))
-      cat(htmltools::renderTags(widget)$html)
+                          , elementId = paste0("table_", .y))%>%
+  # Round standard numbers (LFC, Difference, etc.)
+  #formatRound(columns = other_nums, digits = 3) %>%
+  # Use Scientific Notation for P-values to avoid "0.000"
+  formatSignif(columns = pval_col, digits = 3)
+  
+  cat(htmltools::renderTags(widget)$html)
     } else {
       cat("No significant data for this comparison.")
     }
@@ -1654,6 +1647,9 @@ suppa_for_upset <- suppa_local_datas %>%
   bind_rows(.id = "contrast") %>%
   # extract significant events
   dplyr::filter(pval < fdrThreshold) %>%
+  # separate rows because gene_id still contains concatenated genes
+  # tidyr will copy all the values for each new row
+  tidyr::separate_rows(gene_id, sep = "_and_") %>%
   # get cols
   dplyr::select(gene_id,event_type,contrast) %>% 
   # re-split again
@@ -1661,7 +1657,6 @@ suppa_for_upset <- suppa_local_datas %>%
   # nest by contrast
   purrr::map(~ split(.x$gene_id, .x$contrast))
   
-# rename list (or later)
 
 rm(suppa_isoform_datas, suppa_local_datas)
 a <- gc()
@@ -1674,18 +1669,19 @@ a <- gc()
 DEXSeq is run on estimated transcript counts from salmon to detect differential transcript usage following [this workflow](https://f1000research.com/articles/7-952). In this case, we compare the `~sample + transcript + condition:transcript` model to the smaller null model `~ sample + transcript`. 
 
 Outputs:
-- DEXSeqDataSet.*.rds - R object with the tests from DEXSeq
-- DEXSeqResults.{contrast}.rds - DEXSeqResults R object with the full results
-- DEXSeqResults.{contrast}.tsv - DEXSeqResults.{contrast}.rds object saved out in TSV format (both only contain p-values and q-values on a per-transcript level)
-- perGeneQValue.{contrast}.rds - R object of gene level q-values aggregating evidence from multiple tests to a gene level
-- perGeneQValue.{contrast}.tsv - same perGeneQValue.{contrast}.rds object in TSV format
+
+  - `DEXSeqDataSet.*.rds` - R object with the tests from DEXSeq
+  - `DEXSeqResults.{contrast}.rds` - DEXSeqResults R object with the full results
+  - `DEXSeqResults.{contrast}.tsv` - DEXSeqResults.{contrast}.rds object saved out in TSV format (both only   co`ntain p-values and q-values on a per-transcript level)
+  - `perGeneQValue.{contrast}.rds` - R object of gene level q-values aggregating evidence from multiple tests   to` a gene level
+  - `perGeneQValue.{contrast}.tsv` - same perGeneQValue.{contrast}.rds object in TSV format
 
 Following DEXseq, [stageR](https://bioconductor.org/packages/release/bioc/html/stageR.html) is run for post-processing of transcript- and gene-level p-values. For more information, see section 3 of the [stageR vignette](https://bioconductor.org/packages/release/bioc/vignettes/stageR/inst/doc/stageRVignette.html).
 
 Outputs:
-- stageRTx.{contrast}.rds - R object of class `stageRTx` which has p-value correction with stageWiseAdjustment with 5% target Overall FDR (alpha=0.05) and method=“dtu”
-- getAdjustedPValues.{contrast}.rds - R object of results - a matrix with transcript and gene level adjusted p-values with gene and respective transcript level gene identifiers in the first two columns
-- getAdjustedPValues.{contrast}.tsv is a TSV file identical to getAdjustedPValues.{contrast}.rds
+  - `stageRTx.{contrast}.rds` - R object of class `stageRTx` which has p-value correction with   stageWiseAdjustment with 5% target Overall FDR (alpha=0.05) and method=“dtu”
+  - `getAdjustedPValues.{contrast}.rds` - R object of results - a matrix with transcript and gene level   adjusted p-values with gene and respective transcript level gene identifiers in the first two columns
+  - `getAdjustedPValues.{contrast}.tsv` is a TSV file identical to getAdjustedPValues.{contrast}.rds
 
 We will look at the final adjusted p-values by stageR.
 
@@ -1700,21 +1696,6 @@ dxobjs <- list.files(file.path(base_dir, "star_salmon", "dexseq_dtu","results", 
 
 ```{r}
 #| label: stager paths
-
-# Accessing raw stager objects
-# pattern <- "stageRTx.([A-Za-z0-9_-]+).rds"
-# robjs <- list.files(file.path(base_dir, "star_salmon", "dexseq_dtu","results", "stager")
-#            ,pattern=pattern
-#            ,full.names = TRUE)
-# 
-# # Load the object
-# stageRObj <- readRDS(robjs[1])
-# # Try access functions
-# head(getSignificantGenes(stageRObj)) # get sign genes
-# head(getSignificantTx(stageRObj)) # .. and txs
-# padj <- getAdjustedPValues(stageRObj, order=TRUE, onlySignificantGenes=FALSE)
-# head(padj)
-
 
 # Extract paths to results for all contrasts
 pattern <- "getAdjustedPValues.([A-Za-z0-9_-]+).rds"
@@ -1793,7 +1774,7 @@ purrr::iwalk(stager_datas, ~{
           axis.text.y = element_text(size = 10)
         ) +
         scale_color_manual(values = c("grey60","#e41a1c"),na.translate = FALSE) +
-        ggrepel::geom_text_repel(
+        ggrepel::geom_label_repel(
           data = top_genes,
           aes(label = gene_name),
           size = 4,
@@ -1838,13 +1819,20 @@ iwalk(stager_datas, ~{
   
   # Print interactive html table only if not empty
   if(nrow(current_data) > 0) {
-      widget <- datatable(current_data
-                          , options = list(pageLength = 5
-                                           , dom = 'tip'
+      widget <- datatable(current_data,
+                          extensions = 'Buttons',
+                          options = list(pageLength = 10
+                                           , dom = 'Blfrtip'
                                            , scrollX = TRUE
                                            ,autoWidth = TRUE
                                            ,buttons = c('copy', 'csv', 'excel'))
-                          , elementId = paste0("table_", .y))
+                          , elementId = paste0("table_", .y)) %>% 
+          formatRound(columns = c('exonBaseMean',
+                                  'dispersion',
+                                  'stat'), digits = 3) %>%
+          formatSignif(columns = c('pvalue', 'padj',
+                                   'stager_padj_gene',
+                                   'stager_padj_tx'), digits = 3)
       cat(htmltools::renderTags(widget)$html)
     } else {
       cat("No significant data for this comparison.")
@@ -1864,7 +1852,13 @@ cat("\n\n:::\n\n")
 #| label: save hits for upset and gc stager dtu
 
 # Extract significant transcripts by stageR padj
-stageR_for_upset <- purrr::map(stager_datas, ~ .x %>% filter(stager_padj_tx<fdrThreshold) %>% pull(featureID) %>% unique())
+# Extract their gene levels instead for gene-level overlap
+stageR_for_upset <- purrr::map(stager_datas, ~{
+  .x %>%
+    filter(stager_padj_tx<fdrThreshold) %>%
+    #pull(featureID) %>%
+    pull(groupID) %>%
+    unique()})
 
 rm(stager_datas)
 a <- gc() # assign output to variable to silence it
@@ -1883,7 +1877,13 @@ Consequently, the difference in isoform usage is quantified as the difference in
 
 IsoformSwitchAnalyzeR [support multiple tools](https://www.bioconductor.org/packages/release/bioc/vignettes/IsoformSwitchAnalyzeR/inst/doc/IsoformSwitchAnalyzeR.html#identifying-isoform-switches) (including custom) for testing for significant isoform switches. nf-core/rnasplice [uses](https://github.com/nf-core/rnasplice/blob/dev/bin/run_isoformswitchanalyzer.R) package [satuRn](https://bioconductor.org/packages/release/bioc/html/satuRn.html) for \> 5 replicates per condition and otherwise, [DEXseq](https://f1000research.com/articles/7-952/v1) package. [Default dIF cutoff value](https://nf-co.re/rnasplice/dev/parameters/#isoformswitchanalyzer_dIF) in nf-core/rnasplice is 0.1 and FDR cutoff is 0.05.
 
-IsoformSwitchAnalyzeR performs [alternative splicing analysis](https://www.bioconductor.org/packages/release/bioc/vignettes/IsoformSwitchAnalyzeR/inst/doc/IsoformSwitchAnalyzeR.html#analyzing-alternative-splicing) by lifting over functions from former spliceR package.
+IsoformSwitchAnalyzeR performs [alternative splicing analysis](https://www.bioconductor.org/packages/release/bioc/vignettes/IsoformSwitchAnalyzeR/inst/doc/IsoformSwitchAnalyzeR.html#analyzing-alternative-splicing) at the level of AS event types by lifting over functions from (deprecated) spliceR package.
+
+Output files:
+
+  - `switchlist.rds` - the main IsoformSwitchList R object from the analysis
+  - `isoformswitchanalyzer_summary.csv` - a summary table with no. of switches identified per comparison
+  - `isoformswitchanalyzer_isoformfeatures.csv` - main results table as the csv file
 
 ```{r}
 #| label: isa-path and default params
@@ -1961,6 +1961,8 @@ extractSplicingSummary(
 )
 ```
 
+This summary shows if there is a significant difference in the direction of events (gains vs losses).
+
 ```{r}
 #| label: test for uneven as event direction
 # Analyze if there is statistically more event gains than losses
@@ -1973,6 +1975,8 @@ splicingEnrichment <- extractSplicingEnrichment(
     returnSummary=TRUE
 )
 ```
+
+The following plot summarizes the genome-wide distribution of isoform fraction (IF) values for all isoforms with vs without a specific event type annotation.
 
 ```{r}
 #| label:  transcriptome wide comparison of difference in all events
@@ -1993,10 +1997,9 @@ extractSplicingGenomeWide(
 
 
 
-
 ### Isoform Features Table
 
-Showing top N isoform switches for each comparison.
+Showing significant isoform switches for all comparisons.
 
 ```{r}
 #| label:  isoform-table
@@ -2011,7 +2014,7 @@ top_hits <- extractTopSwitches(
     extractGenes=TRUE,
     alpha=fdrThreshold,
     dIFcutoff = effect_size_cutoff,
-    n=topN, #default=10
+    n=Inf, #default=10, Inf to extract all
     inEachComparison=TRUE,
     sortByQvals=TRUE
 )
@@ -2029,7 +2032,11 @@ Individual plots for all significant isoform switches in each comparison are pro
 
 ### Biological consequences of isoform switching
 
-nf-core/rnasplice includes analysis for `'intron_retention', 'ORF_seq_similarity', 'NMD_status'` event types.
+nf-core/rnasplice includes analysis for:
+
+  - 'intron_retention' - Test for differences in intron retentions.
+  - 'ORF_seq_similarity' - Test whether the amino acid sequences of the ORFs are different.
+  - 'NMD_status' -  Test transcripts for differences in sensitivity to Nonsense Mediated Decay (NMD).
 
 
 ```{r}
@@ -2047,7 +2054,7 @@ extractConsequenceSummary(
 
 ## Overlap of biological consequences
 
-Which isoforms have more than one biological consequence.
+How many isoforms have more than one biological consequence.
 
 ```{r}
 #| label: overlap of consequences venn diagram 
@@ -2091,7 +2098,6 @@ myVenn <- VennDiagram::venn.diagram(
 ### Plot the venn diagram
 grid::grid.newpage() ; grid::grid.draw(myVenn)
 ```
-
 
 
 ```{r}
@@ -2155,9 +2161,9 @@ a <- gc()
 
 ------------------------------------------------------------------------
 
-# Overlap between tools
+# Overlap between comparisons
 
-## Events
+## AS Events overlap between comparisons for each tool
 
 ```{r}
 #| label: upset plots events
@@ -2233,7 +2239,7 @@ names(isa_for_upset_event) %<>% replace_when(
 
 
 # 1. List for overlap between the tools for each event type and contrast
-# Apparently there are too few events or an overlap
+# Overlap is very small, not worth plotting
 # event_hits_lists <- purrr::map(event_types,  ~{
 #   # .x = event type
 #   purrr::map(comparisons, \(comp){
@@ -2246,16 +2252,17 @@ names(isa_for_upset_event) %<>% replace_when(
 #   ))))
 #   })
 # })
-# 
+# names(event_hits_lists) <- event_types
 
 # 2. List for overlap between the contrasts within each event type and tool
+
+cat('\n\n### rMATS\n\n')
+
 event_list_rmats <- purrr::map(rmats_for_upset,  ~{
   # within each type: have a list per contrast
   as.data.frame(
     UpSetR::fromList(.x))
 })
-  
-cat('\n\n### rMATS\n\n')
 
 cat('\n\n::: {.panel-tabset}\n\n')
 
@@ -2264,13 +2271,79 @@ iwalk(event_list_rmats, ~{
   cat('###', .y, '\n\n')
   # print(ComplexUpset::upset(.x,
   #                           intersect = colnames(.x)))
-  print(UpSetR::upset(.x))
+  print(UpSetR::upset(.x,
+                      nsets = length(.x), #show all sets
+                      text.scale=1.5,
+                      main.bar.color="#2c3e50",
+                      matrix.color="#2c3e50",
+                      sets.bar.color="lightgrey",
+                      sets.x.label = ""
+                      ))
   cat('\n\n')
 })
 
 cat('\n\n:::\n\n')
+
+
+
+cat('\n\n### SUPPA\n\n')
+
+event_list_suppa <- purrr::map(suppa_for_upset,  ~{
+  # within each type: have a list per contrast
+  as.data.frame(
+    UpSetR::fromList(.x))
+})
+
+cat('\n\n::: {.panel-tabset}\n\n')
+
+# upset plots
+iwalk(event_list_suppa, ~{
+  cat('###', .y, '\n\n')
+  print(UpSetR::upset(.x,
+                      nsets = length(.x), #show all sets
+                      text.scale=1.5,
+                      main.bar.color="#2c3e50",
+                      matrix.color="#2c3e50",
+                      sets.bar.color="lightgrey",
+                      sets.x.label = ""
+                      ))
+  cat('\n\n')
+})
+
+cat('\n\n:::\n\n')
+
+cat('\n\n### IsoformSwitchAnalyzer\n\n')
+
+event_list_isa <- purrr::map(isa_for_upset_event,  ~{
+  # within each type: have a list per contrast
+  as.data.frame(
+    UpSetR::fromList(.x))
+})
+
+cat('\n\n::: {.panel-tabset}\n\n')
+
+# upset plots
+iwalk(event_list_isa, ~{
+  cat('###', .y, '\n\n')
+  # print(ComplexUpset::upset(.x,
+  #                           intersect = colnames(.x)))
+  print(UpSetR::upset(.x,
+                      nsets = length(.x), #show all sets
+                      text.scale=1.5,
+                      main.bar.color="#2c3e50",
+                      matrix.color="#2c3e50",
+                      sets.bar.color="lightgrey",
+                      sets.x.label = ""
+                      ))
+  cat('\n\n')
+})
+
+cat('\n\n:::\n\n')
+
+
 ```
 
+# Overlap between tools
 
 ## DEU
 
@@ -2305,7 +2378,13 @@ cat('\n\n::: {.panel-tabset}\n\n')
 iwalk(deu_hits_lists, ~{
   cat('###', .y, '\n\n')
   #print(ComplexUpset::upset(.x, intersect = c('DEXseq', 'edgeR')))
-  print(UpSetR::upset(.x))
+  print(UpSetR::upset(.x,
+                      text.scale=2,
+                      main.bar.color="#2c3e50",
+                      matrix.color="#2c3e50",
+                      sets.bar.color="lightgrey",
+                      sets.x.label = ""
+                      ))
   cat('\n\n')
 })
 
@@ -2316,25 +2395,13 @@ cat('\n\n:::\n\n')
 ## DTU
 
 
-The overlap between DEXseq differential trasncript usage and isoformSwitchAnalyzer hits includes all significant *transcripts* called by both tools. DEXseq hits are filtered by *stageR transcript adjusted p-value*.
+The overlap between DEXseq differential trasncript usage and isoformSwitchAnalyzer hits includes all *genes* with at least *one significant transcript* called by both tools. Note that overlap is shown at gene level and does not imply the same transcript has been selected by both tools. DEXseq hits are filtered by stageR *transcript-level* adjusted p-value.
 
 ```{r}
 #| label: DTU-upset-plots
 #| output: asis
 #| echo: false
 
-
-
-# # Isoform Switch Analyzer:
-# # #TODO: add gene name - we intersect by transcript now but there is too little overlap.
-# #  isoform_features_data %<>%
-# #   # This column is duplicated gene_name
-# #   dplyr::select(-gene_id) %>% 
-# #   # add gene_id based on tx_id information (this takes too long)
-# #   left_join(tx2gene %>% dplyr::select(gene_id, transcript_id, transcript_biotype)
-# #             , by = join_by(isoform_id==transcript_id))
-# # For whatever reason, isa uses gene symbol as gene_id :( but luckily there is proper isoform id so we use tx level
- 
 
 # DEXseq DTU:
 dtu_cntrs <- names(stageR_for_upset)
@@ -2345,7 +2412,7 @@ dtu_hits_lists <- purrr::map(dtu_cntrs, ~{
     UpSetR::fromList(
       list(
         stageR = stageR_for_upset[[.x]],
-        IsoformSA = isa_for_upset[[.x]]
+        IsoformSA = isa_for_upset_dtu[[.x]]
   )))
 })
 
@@ -2358,7 +2425,12 @@ iwalk(dtu_hits_lists, ~{
   cat('###', .y, '\n\n')
   #print(ComplexUpset::upset(.x, intersect = c('stageR', 'IsoformSA')))
   #broken in newer ggplot - this open PR should fix https://github.com/krassowski/complex-upset/pull/217
-  print(UpSetR::upset(.x))
+  print(UpSetR::upset(.x,
+                      text.scale=2,
+                      main.bar.color="#2c3e50",
+                      matrix.color="#2c3e50",
+                      sets.bar.color="lightgrey",
+                      sets.x.label = ""))
   cat('\n\n')
 })
 
@@ -2384,8 +2456,8 @@ This report integrates results from several complementary splicing analysis tool
 ## Key Considerations
 
 -   **Concordance**: Look for events detected by multiple tools for highest confidence
--   **Effect Size**: Consider both statistical significance and biological magnitude (e.g., \|dPSI\| \> 0.1, \|logFC\| \> 1)
--   **Functional Imp -act**: IsoformSwitchAnalyzeR predictions help prioritize biologically relevant switches
+-   **Effect Size**: Consider both statistical significance and biological magnitude (e.g., $|dPSI| > 0.1$, $|logFC| > 1$)
+-   **Functional Impact**: IsoformSwitchAnalyzeR predictions help prioritize biologically relevant switches
 -   **Coverage**: Different tools may detect different aspects of splicing regulation
 
 ## Next Steps
